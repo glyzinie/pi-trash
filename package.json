@@ -1,0 +1,31 @@
+{
+  "name": "pi-trash",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal macOS Trash custom tool for Pi.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "trash",
+    "macos"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/glyzinie/pi-trash.git"
+  },
+  "bugs": {
+    "url": "https://github.com/glyzinie/pi-trash/issues"
+  },
+  "homepage": "https://github.com/glyzinie/pi-trash#readme"
+}
