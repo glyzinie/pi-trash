@@ -1,103 +1,147 @@
-import { spawn } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { constants } from "node:fs";
+import { access, lstat, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const TRASH = "/usr/bin/trash";
+const MAX_SUMMARY_PATHS = 10;
+const MAX_DISPLAY_PATH_CHARS = 160;
+
+interface TrashOptions {
+  platform?: NodeJS.Platform;
+  isAvailable?: () => Promise<boolean>;
+}
 
 function isInside(path: string, root: string): boolean {
   const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-function validatePath(input: string, cwd: string, workspace: string): string {
-  const target = resolve(cwd, input);
+export function selectTopLevelTrashEntries(
+  entries: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const selected = new Map(entries);
+  if (entries.size < 2) return selected;
 
-  if (!isInside(target, workspace)) {
-    throw new Error(`Refusing to trash path outside workspace: ${input}`);
-  }
-  if (target === workspace) {
-    throw new Error("Refusing to trash the workspace root");
-  }
-
-  lstatSync(target); // Require the target to exist; do not dereference a final symlink.
-
-  const parent = realpathSync(dirname(target));
-  if (!isInside(parent, workspace)) {
-    throw new Error(`Refusing path through symlinked parent outside workspace: ${input}`);
-  }
-
-  return target;
-}
-
-function runTrash(paths: string[], signal?: AbortSignal): Promise<void> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(TRASH, ["-s", ...paths], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-
-    let stderr = "";
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk;
-    });
-
-    const abort = () => child.kill("SIGKILL");
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-
-    child.once("error", reject);
-    child.once("close", (code) => {
-      signal?.removeEventListener("abort", abort);
-
-      if (signal?.aborted) {
-        reject(new Error("aborted"));
-      } else if (code === 0) {
-        resolvePromise();
-      } else {
-        reject(new Error(stderr.trim() || `trash exited with code ${code}`));
+  // Look up ancestors instead of comparing every pair, preserving input order.
+  for (const target of entries.keys()) {
+    let current = target;
+    for (let parent = dirname(current); parent !== current; parent = dirname(current)) {
+      if (entries.has(parent)) {
+        selected.delete(target);
+        break;
       }
-    });
-  });
+      current = parent;
+    }
+  }
+  return selected;
 }
 
-export default function trashExtension(pi: ExtensionAPI) {
-  let workspace = realpathSync(process.cwd());
+export async function validateTrashPath(input: string, workspace: string): Promise<string> {
+  const value = input.startsWith("@") ? input.slice(1) : input;
+  const target = resolve(workspace, value);
+  if (target === workspace) throw new Error("Refusing to trash the workspace root");
 
-  pi.on("session_start", (_event, ctx) => {
-    workspace = realpathSync(ctx.cwd);
+  // Resolve only the parent: absolute workspace aliases are valid, and the
+  // final symlink itself must be moved rather than its destination.
+  const parent = await realpath(dirname(target));
+  const canonicalTarget = resolve(parent, basename(target));
+  if (canonicalTarget === workspace) throw new Error("Refusing to trash the workspace root");
+  if (!isInside(parent, workspace)) {
+    const reason = isInside(target, workspace)
+      ? "Refusing path through symlinked parent outside workspace"
+      : "Refusing to trash path outside workspace";
+    throw new Error(`${reason}: ${input}`);
+  }
+  await lstat(canonicalTarget);
+  return canonicalTarget;
+}
+
+function displayPath(path: string): string {
+  const characters = Array.from(path);
+  const preview = characters.length > MAX_DISPLAY_PATH_CHARS
+    ? `${characters.slice(0, MAX_DISPLAY_PATH_CHARS).join("")}…`
+    : path;
+  return JSON.stringify(preview).replace(/[\x7f-\x9f\u2028\u2029]/g,
+    (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+export default function trashExtension(pi: ExtensionAPI, options: TrashOptions = {}): void {
+  const platform = options.platform ?? process.platform;
+  const isAvailable = options.isAvailable ?? (async () => {
+    try {
+      await access(TRASH, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
   });
 
   pi.registerTool({
     name: "trash",
     label: "trash",
-    description: "Move files or directories inside the current workspace to the macOS Trash. Use this instead of rm for deletions.",
+    description: "Move files or directories inside the current workspace to the macOS Trash.",
+    promptSnippet: "Move workspace files or directories to the macOS Trash",
+    promptGuidelines: [
+      "Use trash instead of bash rm or rmdir when deleting files or directories inside the workspace.",
+    ],
     parameters: Type.Object({
-      paths: Type.Array(Type.String({ minLength: 1 }), {
+      paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
         minItems: 1,
+        maxItems: 100,
         description: "Workspace-relative or absolute paths to move to Trash. Globs are not expanded.",
       }),
     }),
+    executionMode: "sequential",
 
     async execute(_id, { paths }, signal, _onUpdate, ctx) {
-      if (process.platform !== "darwin") {
-        throw new Error("trash tool requires macOS");
+      if (signal?.aborted) throw new Error("trash aborted");
+      if (platform !== "darwin" || !(await isAvailable())) {
+        throw new Error("trash requires macOS 15 or later");
       }
 
-      const cwd = realpathSync(ctx.cwd);
-      if (!isInside(cwd, workspace)) {
-        throw new Error(`Current cwd is outside workspace: ${cwd}`);
+      const workspace = await realpath(ctx.cwd);
+      if (signal?.aborted) throw new Error("trash aborted");
+
+      // The schema caps this batch at 100 paths. Validate the whole batch before
+      // moving anything, and avoid duplicate input I/O without caching identities.
+      const validated = await Promise.all([...new Set(paths)].map(async (input) =>
+        [await validateTrashPath(input, workspace), input] as const
+      ));
+      const entries = new Map<string, string>();
+      for (const [target, input] of validated) {
+        if (!entries.has(target)) entries.set(target, input);
       }
 
-      const targets = paths.map((path) => validatePath(path, cwd, workspace));
-      await runTrash(targets, signal);
+      const selectedEntries = selectTopLevelTrashEntries(entries);
+      const targets = [...selectedEntries.keys()];
+      if (signal?.aborted) throw new Error("trash aborted");
+      const result = await pi.exec(TRASH, ["-s", ...targets], {
+        cwd: workspace,
+        signal,
+      });
+      if (result.killed || result.code !== 0) {
+        const reason = result.killed
+          ? (signal?.aborted ? "trash aborted" : "trash was terminated")
+          : (result.stderr.trim() || `trash exited with code ${result.code}`);
+        throw new Error(`${reason}\nSome paths may already have been moved to Trash.`);
+      }
+
+      const moved = [...selectedEntries.values()];
+      const shown = moved.slice(0, MAX_SUMMARY_PATHS);
+      const omitted = moved.length - shown.length;
+      const covered = entries.size - selectedEntries.size;
+      const summary = shown.map((path) => `- ${displayPath(path)}`).join("\n") +
+        (omitted > 0 ? `\n- …and ${omitted} more` : "") +
+        (covered > 0
+          ? `\n(${covered} nested path${covered === 1 ? "" : "s"} covered by a parent path.)`
+          : "");
 
       return {
-        content: [{
-          type: "text" as const,
-          text: `Moved to Trash:\n${paths.map((path) => `- ${path}`).join("\n")}`,
-        }],
+        content: [{ type: "text" as const, text: `Moved to Trash:\n${summary}` }],
         details: { paths: targets },
       };
     },
